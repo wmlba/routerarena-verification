@@ -25,6 +25,13 @@ from typing import Optional, Any, Dict
 # Global storage for original references used by reliability_guard
 originals: Dict[str, Any] = {}
 
+# Address-space headroom for each forked test process, on top of what it inherits from the
+# evaluator. Unbounded allocations in generated code otherwise exhaust the evaluation host.
+# Set ROUTERARENA_LCB_MEMORY_HEADROOM_BYTES=0 to disable the limit.
+LCB_MEMORY_HEADROOM_BYTES = int(
+    os.environ.get("ROUTERARENA_LCB_MEMORY_HEADROOM_BYTES", str(2 * 1024**3))
+)
+
 
 def has_code(response):
     pattern = r"```(?:[a-zA-Z]*)\n(.*?)```"
@@ -340,11 +347,38 @@ def unsafe_lcb_runTests(problem, completion, timeout, runtime_debug, is_extracte
     return result
 
 
+def limit_test_memory(headroom_bytes: int) -> None:
+    """Cap this process's address space at its current size plus ``headroom_bytes``.
+
+    Linux only; elsewhere, or when ``headroom_bytes`` is not positive, this does nothing.
+    Must run before ``reliability_guard``, which hides the ``resource`` module.
+    """
+    if headroom_bytes <= 0:
+        return
+    try:
+        import resource
+
+        with open("/proc/self/status") as status:
+            current = next(
+                int(line.split()[1]) * 1024
+                for line in status
+                if line.startswith("VmSize:")
+            )
+        limit = current + headroom_bytes
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        if hard != resource.RLIM_INFINITY:
+            limit = min(limit, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    except (ImportError, OSError, StopIteration, ValueError):
+        pass
+
+
 def run_tests_for_one_example(
     test_cases, completion, result_list, runtime_debug, is_extracted
 ):
     time_elapsed = float("inf")
     test_type = test_cases[0]["testtype"]
+    limit_test_memory(LCB_MEMORY_HEADROOM_BYTES)
     reliability_guard()
     for _i, test_case in enumerate(test_cases):
         output_error = ""
